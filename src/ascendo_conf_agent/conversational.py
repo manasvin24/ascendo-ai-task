@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 import logging
+import os
 
 from ascendo_conf_agent.types import GraphState, FitResult, Evidence
 from ascendo_conf_agent.graph.nodes.planner import planner_node
@@ -190,12 +191,44 @@ class FitAgent(ConversationalAgent):
         
         # Send enrichment request in batches
         log.info(f"FIT: Requesting enrichment for {len(borderline)} borderline companies")
+        
+        # Write ICP scoring artifact (CSV 2) before enrichment
+        self._write_icp_artifact(state, stage="initial")
+        
         return state, Message(
             sender=self.name,
             recipient="enrichment",
             content="enrich_request",
             payload={"borderline_companies": borderline[:10]}  # Limit to 10
         )
+    
+    def _write_icp_artifact(self, state: GraphState, stage: str) -> None:
+        """Write ICP scored companies to CSV for agent handoff."""
+        import os
+        import pandas as pd
+        from ascendo_conf_agent.config import SETTINGS
+        
+        os.makedirs(SETTINGS.output_dir, exist_ok=True)
+        
+        rows = []
+        for result in state.fit_results:
+            rows.append({
+                "company_name": result.company_name,
+                "icp_fit": result.icp_fit,
+                "confidence": result.confidence,
+                "rationale": result.rationale,
+                "scored_at": pd.Timestamp.now().isoformat()
+            })
+        
+        df = pd.DataFrame(rows)
+        csv_path = os.path.join(SETTINGS.output_dir, f"stage2_icp_{stage}.csv")
+        df.to_csv(csv_path, index=False)
+        
+        if not hasattr(state, "notes") or state.notes is None:
+            state.notes = {}
+        state.notes[f"icp_artifact_{stage}"] = csv_path
+        
+        log.info(f"ARTIFACT: Wrote {len(rows)} ICP scores to {csv_path}")
     
     def _update_fit_counts(self, state: GraphState) -> None:
         counts: dict[str, int] = {"Yes": 0, "Maybe": 0, "No": 0}
@@ -229,6 +262,13 @@ class EnrichmentAgent(ConversationalAgent):
         
         log.info(f"ENRICHMENT: Searching for evidence on {len(borderline_companies)} companies")
         
+        # Load extraction artifact (CSV 1) to access original evidence
+        extraction_csv = state.notes.get("extraction_artifact")
+        if extraction_csv and os.path.exists(extraction_csv):
+            import pandas as pd
+            extraction_df = pd.read_csv(extraction_csv)
+            log.info(f"ENRICHMENT: Loaded {len(extraction_df)} companies from extraction artifact")
+        
         enriched_companies = []
         seed_url = state.seed_url.rstrip('/')
         search_targets = ["/sponsors", "/mediapartners", "/partners", "/exhibitors"]
@@ -261,6 +301,9 @@ class EnrichmentAgent(ConversationalAgent):
         
         log.info(f"ENRICHMENT: Found evidence for {len(enriched_companies)}/{len(borderline_companies)} companies")
         
+        # Write enriched companies back to updated extraction artifact
+        self._write_enriched_artifact(state, enriched_companies)
+        
         # Send enriched companies for re-scoring
         return state, Message(
             sender=self.name,
@@ -268,6 +311,37 @@ class EnrichmentAgent(ConversationalAgent):
             content="rescore_request",
             payload={"enriched_companies": enriched_companies}
         )
+    
+    def _write_enriched_artifact(self, state: GraphState, enriched_companies: list[str]) -> None:
+        """Update extraction artifact with enriched evidence."""
+        import pandas as pd
+        import os
+        from ascendo_conf_agent.config import SETTINGS
+        
+        os.makedirs(SETTINGS.output_dir, exist_ok=True)
+        
+        rows = []
+        for rec in state.company_records:
+            if rec.company_name in enriched_companies:
+                evidence_urls = [e.url for e in rec.evidence]
+                evidence_snippets = [e.snippet[:100] for e in rec.evidence[:5]]
+                
+                rows.append({
+                    "company_name": rec.company_name,
+                    "speakers_count": rec.speakers_count,
+                    "source_pages": "; ".join(sorted(rec.sources)),
+                    "evidence_urls": " | ".join(evidence_urls[:10]),
+                    "evidence_snippets": " | ".join(evidence_snippets),
+                    "enriched": True,
+                    "enriched_at": pd.Timestamp.now().isoformat()
+                })
+        
+        if rows:
+            df = pd.DataFrame(rows)
+            csv_path = os.path.join(SETTINGS.output_dir, "stage1_enriched_companies.csv")
+            df.to_csv(csv_path, index=False)
+            state.notes["enriched_artifact"] = csv_path
+            log.info(f"ARTIFACT: Wrote {len(rows)} enriched companies to {csv_path}")
 
 
 class FitRescoreAgent(ConversationalAgent):
@@ -354,7 +428,38 @@ class FitRescoreAgent(ConversationalAgent):
         log.info(f"FIT_RESCORE: {changes} companies changed classification")
         self._update_fit_counts(state)
         
+        # Write final ICP artifact (CSV 2 - rescored)
+        self._write_final_icp_artifact(state)
+        
         return state, Message(sender=self.name, recipient="export", content="complete")
+    
+    def _write_final_icp_artifact(self, state: GraphState) -> None:
+        """Write final rescored ICP results to CSV."""
+        import os
+        import pandas as pd
+        from ascendo_conf_agent.config import SETTINGS
+        
+        os.makedirs(SETTINGS.output_dir, exist_ok=True)
+        
+        rows = []
+        for result in state.fit_results:
+            rows.append({
+                "company_name": result.company_name,
+                "icp_fit": result.icp_fit,
+                "confidence": result.confidence,
+                "rationale": result.rationale,
+                "scored_at": pd.Timestamp.now().isoformat()
+            })
+        
+        df = pd.DataFrame(rows)
+        csv_path = os.path.join(SETTINGS.output_dir, "stage2_icp_final.csv")
+        df.to_csv(csv_path, index=False)
+        
+        if not hasattr(state, "notes") or state.notes is None:
+            state.notes = {}
+        state.notes["icp_artifact_final"] = csv_path
+        
+        log.info(f"ARTIFACT: Wrote {len(rows)} final ICP scores to {csv_path}")
     
     def _update_fit_counts(self, state: GraphState) -> None:
         counts: dict[str, int] = {"Yes": 0, "Maybe": 0, "No": 0}
